@@ -42,6 +42,8 @@ moment.locale('zh-cn', {
 
 import_datas = [
   "abuse_count",
+  "ban_mc",
+  "vpass",
   "rag",
   "rid",
   "is_post_watcher",
@@ -269,6 +271,61 @@ if settings.modules.challonge.enabled
   challonge = require('challonge').createClient({
     apiKey: settings.modules.challonge.api_key
   })
+  if settings.modules.challonge.cache_ttl
+    challonge_cache = []
+  challonge_queue_callbacks = [[], []]
+  is_requesting = [false, false]
+  get_callback = (challonge_type, _callback) ->
+    return ((err, data) ->
+      if settings.modules.challonge.cache_ttl and !err and data
+        challonge_cache[challonge_type] = data
+      _callback(err, data)
+      while challonge_queue_callbacks[challonge_type].length
+        cur_callback = challonge_queue_callbacks[challonge_type].splice(0, 1)[0]
+        cur_callback(err, data)
+      is_requesting[challonge_type] = false
+      return
+    )
+  challonge.participants._index = (_data) ->
+    if settings.modules.challonge.cache_ttl and challonge_cache[0]
+      _data.callback(null, challonge_cache[0])
+    else if is_requesting[0]
+      challonge_queue_callbacks[0].push(_data.callback)
+    else
+      _data.callback = get_callback(0, _data.callback)
+      is_requesting[0] = true
+      challonge.participants.index(_data)
+    return 
+  challonge.matches._index = (_data) ->
+    if settings.modules.challonge.cache_ttl and challonge_cache[1]
+      _data.callback(null, challonge_cache[1])
+    else if is_requesting[1]
+      challonge_queue_callbacks[1].push(_data.callback)
+    else
+      _data.callback = get_callback(1, _data.callback)
+      is_requesting[1] = true
+      challonge.matches.index(_data)
+    return
+  refresh_challonge_cache = () ->
+    if settings.modules.challonge.cache_ttl
+      challonge_cache[0] = null
+      challonge_cache[1] = null
+    return
+  refresh_challonge_cache()
+  # challonge.participants._index({
+  #   id: settings.modules.challonge.tournament_id,
+  #   callback: (() ->
+  #     challonge.matches._index({
+  #       id: settings.modules.challonge.tournament_id,
+  #       callback: (() ->
+  #         return
+  #       )
+  #     })
+  #     return
+  #   )
+  # })
+  if settings.modules.challonge.cache_ttl
+    setInterval(refresh_challonge_cache, settings.modules.challonge.cache_ttl)
 
 # 获取可用内存
 memory_usage = 0
@@ -470,7 +527,9 @@ release_disconnect = (dinfo, reconnected) ->
   return
 
 CLIENT_get_authorize_key = (client) ->
-  if settings.modules.mycard.enabled or settings.modules.tournament_mode.enabled or settings.modules.challonge.enabled or client.is_local
+  if !settings.modules.mycard.enabled and client.vpass
+    return client.name + "$" + client.vpass
+  else if settings.modules.mycard.enabled or settings.modules.tournament_mode.enabled or settings.modules.challonge.enabled or client.is_local
     return client.name
   else
     return client.ip + ":" + client.name
@@ -578,7 +637,7 @@ CLIENT_is_able_to_reconnect = (client, deckbuf) ->
 
 CLIENT_get_kick_reconnect_target = (client, deckbuf) ->
   for room in ROOM_all when room and room.started and !room.windbot
-    for player in room.get_playing_player() when !player.closed and player.name == client.name and player.pass == client.pass and (settings.modules.mycard.enabled or settings.modules.tournament_mode.enabled or player.ip == client.ip) and (!deckbuf or _.isEqual(player.start_deckbuf, deckbuf))
+    for player in room.get_playing_player() when !player.closed and player.name == client.name and (settings.modules.challonge.enabled or player.pass == client.pass) and (settings.modules.mycard.enabled or settings.modules.tournament_mode.enabled or player.ip == client.ip or (client.vpass and client.vpass == player.vpass)) and (!deckbuf or _.isEqual(player.start_deckbuf, deckbuf))
       return player
   return null
 
@@ -732,6 +791,9 @@ CLIENT_heartbeat_register = (client, send) ->
   , settings.modules.heartbeat_detection.wait_time)
   #log.info(1, client.name)
   return true
+
+CLIENT_is_banned_by_mc = (client) ->
+  return client.ban_mc and client.ban_mc.banned and moment().isBefore(client.ban_mc.until)
 
 class Room
   constructor: (name, @hostinfo) ->
@@ -934,12 +996,14 @@ class Room
 
     if settings.modules.challonge.enabled and @started and !@kicked
       challonge.matches.update({
-        id: encodeURIComponent(settings.modules.challonge.tournament_id),
+        id: settings.modules.challonge.tournament_id,
         matchId: @challonge_info.id,
         match: @challonge_duel_log,
         callback: (err, data) ->
           if err
             log.warn("Errored pushing scores to Challonge.", err)
+          else
+            refresh_challonge_cache()
           return
       })
     if @player_datas.length and settings.modules.cloud_replay.enabled
@@ -1183,7 +1247,7 @@ net.createServer (client) ->
         ygopro.stoc_die(client, "${cloud_replay_no}")
         return
       redisdb.expire("replay:"+replay.replay_id, 60*60*48)
-      buffer=new Buffer(replay.replay_buffer,'binary')
+      buffer=Buffer.from(replay.replay_buffer,'binary')
       zlib.unzip buffer, (err, replay_buffer) ->
         if err
           log.info "cloud replay unzip error: " + err
@@ -1205,9 +1269,9 @@ net.createServer (client) ->
   client.on 'data', (ctos_buffer) ->
     if client.is_post_watcher
       room=ROOM_all[client.rid]
-      room.watcher.write ctos_buffer if room
+      room.watcher.write ctos_buffer if room and !CLIENT_is_banned_by_mc(client)
     else
-      #ctos_buffer = new Buffer(0)
+      #ctos_buffer = Buffer.alloc(0)
       ctos_message_length = 0
       ctos_proto = 0
       #ctos_buffer = Buffer.concat([ctos_buffer, data], ctos_buffer.length + data.length) #buffer的错误使用方式，好孩子不要学
@@ -1275,7 +1339,7 @@ net.createServer (client) ->
 
   # 服务端到客户端(stoc)
   server.on 'data', (stoc_buffer)->
-    #stoc_buffer = new Buffer(0)
+    #stoc_buffer = Buffer.alloc(0)
     stoc_message_length = 0
     stoc_proto = 0
     #stoc_buffer = Buffer.concat([stoc_buffer, data], stoc_buffer.length + data.length) #buffer的错误使用方式，好孩子不要学
@@ -1346,7 +1410,11 @@ if settings.modules.stop
 ygopro.ctos_follow 'PLAYER_INFO', true, (buffer, info, client, server)->
   # checkmate use username$password, but here don't
   # so remove the password
-  name = info.name.split("$")[0]
+  name_full =info.name.split("$")
+  name = name_full[0]
+  vpass = name_full[1]
+  if vpass and !vpass.length
+    vpass = null
   if (_.any(settings.ban.illegal_id, (badid) ->
     regexp = new RegExp(badid, 'i')
     matchs = name.match(regexp)
@@ -1356,11 +1424,28 @@ ygopro.ctos_follow 'PLAYER_INFO', true, (buffer, info, client, server)->
     return false
   , name))
     client.rag = true
+  if settings.modules.mycard.enabled
+    #console.log(name)
+    request
+      url: settings.modules.mycard.ban_get
+      json: true
+      qs:
+        user: name
+    , (error, response, body)->
+      #console.log(body)
+      if _.isString body
+        log.warn "ban get bad json", body
+      else if error or !body
+        log.warn 'ban get error', error, response
+      else
+        client.ban_mc = body
+      return
   struct = ygopro.structs["CTOS_PlayerInfo"]
   struct._setBuff(buffer)
   struct.set("name", name)
   buffer = struct.buffer
   client.name = name
+  client.vpass = vpass
 
   if not settings.modules.i18n.auto_pick or client.is_local
     client.lang=settings.modules.i18n.default
@@ -1453,7 +1538,7 @@ ygopro.ctos_follow 'JOIN_GAME', false, (buffer, info, client, server)->
     #  struct.set("version", info.version)
     #  buffer = struct.buffer
 
-    buffer = new Buffer(info.pass[0...8], 'base64')
+    buffer = Buffer.from(info.pass[0...8], 'base64')
 
     if buffer.length != 6
       ygopro.stoc_die(client, '${invalid_password_payload}')
@@ -1556,7 +1641,7 @@ ygopro.ctos_follow 'JOIN_GAME', false, (buffer, info, client, server)->
 
     if id = users_cache[client.name]
       secret = id % 65535 + 1
-      decrypted_buffer = new Buffer(6)
+      decrypted_buffer = Buffer.allocUnsafe(6)
       for i in [0, 2, 4]
         decrypted_buffer.writeUInt16LE(buffer.readUInt16LE(i) ^ secret, i)
       if check(decrypted_buffer)
@@ -1575,7 +1660,7 @@ ygopro.ctos_follow 'JOIN_GAME', false, (buffer, info, client, server)->
       if body and body.user
         users_cache[client.name] = body.user.id
         secret = body.user.id % 65535 + 1
-        decrypted_buffer = new Buffer(6)
+        decrypted_buffer = Buffer.allocUnsafe(6)
         for i in [0, 2, 4]
           decrypted_buffer.writeUInt16LE(buffer.readUInt16LE(i) ^ secret, i)
         if check(decrypted_buffer)
@@ -1603,9 +1688,12 @@ ygopro.ctos_follow 'JOIN_GAME', false, (buffer, info, client, server)->
         client.write buffer
     else
       ygopro.stoc_send_chat(client, '${loading_user_info}', ygopro.constants.COLORS.BABYBLUE)
-      challonge.participants.index({
-        id: encodeURIComponent(settings.modules.challonge.tournament_id),
+      client.setTimeout(300000) #连接后超时5分钟
+      challonge.participants._index({
+        id: settings.modules.challonge.tournament_id,
         callback: (err, data) ->
+          if client.closed
+            return
           if err or !data
             if err
               log.warn("Failed loading Challonge user info", err)
@@ -1613,15 +1701,15 @@ ygopro.ctos_follow 'JOIN_GAME', false, (buffer, info, client, server)->
             return
           found = false
           for k,user of data
-            if user.participant and user.participant.name == client.name
+            if user.participant and user.participant.name and _.endsWith(user.participant.name, client.name)
               found = user.participant
               break
           if !found
             ygopro.stoc_die(client, '${challonge_user_not_found}')
             return
           client.challonge_info = found
-          challonge.matches.index({
-            id: encodeURIComponent(settings.modules.challonge.tournament_id),
+          challonge.matches._index({
+            id: settings.modules.challonge.tournament_id,
             callback: (err, data) ->
               if client.closed
                 return
@@ -1652,7 +1740,7 @@ ygopro.ctos_follow 'JOIN_GAME', false, (buffer, info, client, server)->
                 ygopro.stoc_die(client, room.error)
               else if room.started
                 if settings.modules.cloud_replay.enable_halfway_watch and !room.no_watch
-                  client.setTimeout(300000) #连接后超时5分钟
+                  #client.setTimeout(300000) #连接后超时5分钟
                   client.rid = _.indexOf(ROOM_all, room)
                   client.is_post_watcher = true
                   ygopro.stoc_send_chat_to_room(room, "#{client.name} ${watch_join}")
@@ -1665,11 +1753,11 @@ ygopro.ctos_follow 'JOIN_GAME', false, (buffer, info, client, server)->
               else if room.no_watch and room.players.length >= (if room.hostinfo.mode == 2 then 4 else 2)
                 ygopro.stoc_die(client, "${watch_denied_room}")
               else
-                for player in room.players when player and player != client and player.name == client.name
+                for player in room.get_playing_player() when player and player != client and player.challonge_info.id == client.challonge_info.id
                   ygopro.stoc_die(client, "${challonge_player_already_in}")
                   return
                 #client.room = room
-                client.setTimeout(300000) #连接后超时5分钟
+                #client.setTimeout(300000) #连接后超时5分钟
                 client.rid = _.indexOf(ROOM_all, room)
                 room.connect(client)
               return
@@ -2463,7 +2551,7 @@ ygopro.ctos_follow 'CHAT', true, (buffer, info, client, server)->
     cancel = true
   if !(room and (room.random_type or room.arena))
     return cancel
-  if client.abuse_count>=5
+  if client.abuse_count>=5 or CLIENT_is_banned_by_mc(client)
     log.warn "BANNED CHAT", client.name, client.ip, msg
     ygopro.stoc_send_chat(client, "${banned_chat_tip}", ygopro.constants.COLORS.RED)
     return true
@@ -2778,16 +2866,18 @@ ygopro.stoc_follow 'CHANGE_SIDE', false, (buffer, info, client, server)->
         ygopro.stoc_send_chat(client, "${side_remain_part1}#{client.side_tcount}${side_remain_part2}", ygopro.constants.COLORS.BABYBLUE)
     , 60000
     client.side_interval = sinterval
-  if settings.modules.challonge.enabled and client.pos == 0
+  if settings.modules.challonge.enabled and settings.modules.challonge.post_score_midduel and client.pos == 0
     temp_log = JSON.parse(JSON.stringify(room.challonge_duel_log))
     delete temp_log.winnerId
     challonge.matches.update({
-      id: encodeURIComponent(settings.modules.challonge.tournament_id),
+      id: settings.modules.challonge.tournament_id,
       matchId: room.challonge_info.id,
       match: temp_log,
       callback: (err, data) ->
         if err
           log.warn("Errored pushing scores to Challonge.", err)
+        else
+          refresh_challonge_cache()
         return
     })
   if room.random_type or room.arena
@@ -2874,13 +2964,15 @@ if settings.modules.mycard.enabled
 if settings.modules.heartbeat_detection.enabled
   setInterval ()->
     for room in ROOM_all when room and room.started and (room.hostinfo.time_limit == 0 or !room.turn or room.turn <= 0) and !room.windbot
-      for player in room.players when !room.changing_side or player.selected_preduel
+      for player in room.get_playing_player() when player and (!room.changing_side or player.selected_preduel)
         CLIENT_heartbeat_register(player, true)
     return
   , settings.modules.heartbeat_detection.interval
 
 # spawn windbot
-if settings.modules.windbot.spawn
+windbot_looplimit = 0
+
+spawn_windbot = () ->
   if /^win/.test(process.platform)
     windbot_bin = 'WindBot.exe'
     windbot_parameters = []
@@ -2892,9 +2984,15 @@ if settings.modules.windbot.spawn
   windbot_process = spawn windbot_bin, windbot_parameters, {cwd: 'windbot'}
   windbot_process.on 'error', (err)->
     log.warn 'WindBot ERROR', err
+    if windbot_looplimit < 1000
+      windbot_looplimit++
+      spawn_windbot()
     return
   windbot_process.on 'exit', (code)->
     log.warn 'WindBot EXIT', code
+    if windbot_looplimit < 1000
+      windbot_looplimit++
+      spawn_windbot()
     return
   windbot_process.stdout.setEncoding('utf8')
   windbot_process.stdout.on 'data', (data)->
@@ -2904,6 +3002,10 @@ if settings.modules.windbot.spawn
   windbot_process.stderr.on 'data', (data)->
     log.warn 'WindBot Error:', data
     return
+  return
+
+if settings.modules.windbot.enabled and settings.modules.windbot.spawn
+  spawn_windbot()
 
 #http
 if settings.modules.http
